@@ -1,20 +1,20 @@
 import sys
 IN_COLAB = "google.colab" in sys.modules
 
-import os
 import copy
+import os
 import random
 from collections import deque
 from typing import Deque, Dict, List, Tuple
 
 import gym
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from IPython.display import clear_output
+import matplotlib.pyplot as plt
 
 if IN_COLAB and not os.path.exists("segment_tree.py") and not os.path.exists("demo.pkl"):
     # download segment tree module
@@ -41,16 +41,16 @@ class ReplayBuffer:
         state_size: int, 
         size: int, 
         batch_size: int = 32, 
+        n_step: int = 3, 
         gamma: float = 0.99,
         demo: list = None,
-        n_step: int = 1, 
     ):
         """Initialize."""
-        self.obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.next_obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.acts_buf = np.zeros([size], dtype=np.float32)
-        self.rews_buf = np.zeros([size], dtype=np.float32)
-        self.done_buf = np.zeros([size], dtype=np.float32)
+        self.state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.action_memory = np.zeros([size], dtype=np.float32)
+        self.reward_memory = np.zeros([size], dtype=np.float32)
+        self.next_state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.done_memory = np.zeros([size], dtype=np.float32)
         self.max_size, self.batch_size = size, batch_size
         self.ptr, self.size = 0, 0
         
@@ -68,11 +68,11 @@ class ReplayBuffer:
             self.size += self.demo_size
             for ptr, d in enumerate(self.demo):
                 state, action, reward, next_state, done = d
-                self.obs_buf[ptr] = state
-                self.acts_buf[ptr] = np.array(action)
-                self.rews_buf[ptr] = reward
-                self.next_obs_buf[ptr] = next_state
-                self.done_buf[ptr] = done
+                self.state_memory[ptr] = state
+                self.action_memory[ptr] = np.array(action)
+                self.reward_memory[ptr] = reward
+                self.next_state_memory[ptr] = next_state
+                self.done_memory[ptr] = done
 
     def store(
         self, 
@@ -91,14 +91,15 @@ class ReplayBuffer:
             return ()
         
         # make a n-step transition
-        rew, next_obs, done = self._get_n_step_info()
+        rew, next_obs, done = self._get_n_step_info(
+        )
         obs, act = self.n_step_buffer[0][:2]
         
-        self.obs_buf[self.ptr] = obs
-        self.next_obs_buf[self.ptr] = next_obs
-        self.acts_buf[self.ptr] = act
-        self.rews_buf[self.ptr] = rew
-        self.done_buf[self.ptr] = done
+        self.state_memory[self.ptr] = obs
+        self.next_state_memory[self.ptr] = next_obs
+        self.action_memory[self.ptr] = act
+        self.reward_memory[self.ptr] = rew
+        self.done_memory[self.ptr] = done
         
         self.ptr += 1
         self.ptr = self.demo_size if self.ptr % self.max_size == 0 else self.ptr
@@ -115,16 +116,18 @@ class ReplayBuffer:
                 len(self), size=self.batch_size, replace=False
             )
             
-        return dict(obs=self.obs_buf[idxs],
-                    next_obs=self.next_obs_buf[idxs],
-                    acts=self.acts_buf[idxs],
-                    rews=self.rews_buf[idxs],
-                    done=self.done_buf[idxs],
+        return dict(obs=self.state_memory[idxs],
+                    next_obs=self.next_state_memory[idxs],
+                    acts=self.action_memory[idxs],
+                    rews=self.reward_memory[idxs],
+                    done=self.done_memory[idxs],
                     # for N-step learning
                     idxs=idxs,
-                   )
+                    )
     
-    def _get_n_step_info(self) -> Tuple[np.int64, np.ndarray, bool]:
+    def _get_n_step_info(
+        self
+    ) -> Tuple[np.int64, np.ndarray, bool]:
         """Return n step rew, next_obs, and done."""
         # info of the last transition
         rew, next_obs, done = self.n_step_buffer[-1][-3:]
@@ -140,26 +143,37 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return self.size
 
+# PrioritizedReplayBuffer
+
 class PrioritizedReplayBuffer(ReplayBuffer):
-    """Prioritized Replay buffer with demonstrations."""
+    """Prioritized Replay buffer with demonstrations.
     
+    Attributes:
+        max_priority (float): max priority
+        tree_ptr (int): next index of tree
+        alpha (float): alpha parameter for prioritized replay buffer
+        sum_tree (SumSegmentTree): sum tree for prior
+        min_tree (MinSegmentTree): min tree for min prior to get max weight
+        
+    """
     
     def __init__(
         self, 
         state_size: int, 
         size: int, 
         batch_size: int = 32, 
-        gamma: float = 0.99,
         alpha: float = 0.6, 
         epsilon_d: float = 1.0,
         demo: list = None,
+        n_step: int = 1, 
+        gamma: float = 0.99,
     ):
         """Initialization."""
         assert alpha >= 0
         
         super(PrioritizedReplayBuffer, self).__init__(
             state_size, size, batch_size, 
-            gamma, demo, n_step=1 
+            n_step, gamma, demo
         )
         self.max_priority, self.tree_ptr = 1.0, 0
         self.alpha = alpha
@@ -193,11 +207,11 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         if transition:
             self.sum_tree[self.tree_ptr] = self.max_priority ** self.alpha
             self.min_tree[self.tree_ptr] = self.max_priority ** self.alpha
-
+            
             self.tree_ptr += 1
             if self.tree_ptr % self.max_size == 0:
                 self.tree_ptr = self.demo_size
-            
+        
         return transition
 
     def sample_batch(self, beta: float = 0.4) -> Dict[str, np.ndarray]:
@@ -207,11 +221,11 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         
         indices = self._sample_proportional()
         
-        obs = self.obs_buf[indices]
-        next_obs = self.next_obs_buf[indices]
-        acts = self.acts_buf[indices]
-        rews = self.rews_buf[indices]
-        done = self.done_buf[indices]
+        obs = self.state_memory[indices]
+        next_obs = self.next_state_memory[indices]
+        acts = self.action_memory[indices]
+        rews = self.reward_memory[indices]
+        done = self.done_memory[indices]
         weights = np.array([self._calculate_weight(i, beta) for i in indices])
         epsilon_d = np.array(
             [self.epsilon_d if i < self.demo_size else 0.0 for i in indices]
@@ -313,11 +327,14 @@ class Actor(nn.Module):
         """Initialize."""
         super(Actor, self).__init__()
         
+        self.state_size = state_size
+        self.action_size = action_size
+        
         # set the hidden layers
-        self.hidden1 = nn.Linear(state_size, 128)
+        self.hidden1 = nn.Linear(self.state_size, 128)
         self.hidden2 = nn.Linear(128, 128)
         
-        self.out = nn.Linear(128, action_size)
+        self.out = nn.Linear(128, self.action_size)
         
         self.out.weight.data.uniform_(-init_w, init_w)
         self.out.bias.data.uniform_(-init_w, init_w)
@@ -331,14 +348,14 @@ class Actor(nn.Module):
         
         return action
     
-class Critic(nn.Module):
+class CriticQ(nn.Module):
     def __init__(
         self, 
         state_size: int, 
         init_w: float = 3e-3,
     ):
         """Initialize."""
-        super(Critic, self).__init__()
+        super(CriticQ, self).__init__()
         
         self.hidden1 = nn.Linear(state_size, 128)
         self.hidden2 = nn.Linear(128, 128)
@@ -353,7 +370,6 @@ class Critic(nn.Module):
         x = F.relu(self.hidden1(x))
         x = F.relu(self.hidden2(x))
         value = self.out(x)
-        
         return value
 
 class DDPGfDAgent:
@@ -406,22 +422,26 @@ class DDPGfDAgent:
         # N-step Learning
         n_step: int = 3,
         # loss parameters
-        lambda1: float = 1.0, # N-step return weight
+        lambda1: float = 1.0,  # N-step return weight
         lambda2: float = 1e-4, # l2 regularization weight
-        lambda3: float = 1.0, # actor loss contribution of prior weight
+        lambda3: float = 1.0,  # actor loss contribution of prior weight
     ):
-        """Initialize."""
-        # networks
-        state_size = env.observation_space.shape[0]
-        action_size = env.action_space.shape[0]
-        
+        """
+        Initialization.
+        """
         self.env = env
+        # networks
+        self.state_size = self.env.observation_space.shape[0]
+        self.action_size = self.env.action_space.shape[0]
         
+        # hyperparameters
         self.batch_size = batch_size
         self.pretrain_step = pretrain_step
         self.gamma = gamma
         self.tau = tau
         self.initial_random_steps = initial_random_steps
+        
+        # loss parameters
         self.lambda1 = lambda1
         self.lambda3 = lambda3
         
@@ -432,12 +452,16 @@ class DDPGfDAgent:
                 demo, n_step
             )
         
+        # device: cpu / gpu
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(self.device)
+        
         # PER
         # memory for 1-step Learning
         self.beta = beta
         self.prior_eps = prior_eps
         self.memory = PrioritizedReplayBuffer(
-            state_size, memory_size, batch_size, gamma, alpha, demo=demos_1_step
+            self.state_size, memory_size, batch_size, gamma, alpha, demo=demos_1_step
         )
         
         # memory for N-step Learning
@@ -445,33 +469,29 @@ class DDPGfDAgent:
         if self.use_n_step:
             self.n_step = n_step
             self.memory_n = ReplayBuffer(
-                state_size, 
+                self.state_size, 
                 memory_size, 
                 batch_size, 
+                n_step,
                 gamma, 
                 demos_n_step, 
-                self.n_step
             )
-
-        # device: cpu / gpu
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(self.device)
         
         # actor
-        self.actor = Actor(state_size, action_size
+        self.actor = Actor(self.state_size, self.action_size
                           ).to(self.device)
-        self.actor_target = Actor(state_size, action_size
+        self.actor_target = Actor(self.state_size, self.action_size
                           ).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        self.critic = Critic(state_size + action_size
+        self.critic = CriticQ(self.state_size + self.action_size
                           ).to(self.device)
-        self.critic_target = Critic(state_size + action_size).to(self.device)
+        self.critic_target = CriticQ(self.state_size + self.action_size).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
         # noise
         self.exploration_noise = OUNoise(
-            action_size,
+            self.action_size,
             theta=ou_noise_theta,
             sigma=ou_noise_sigma,
         )
@@ -489,7 +509,7 @@ class DDPGfDAgent:
         
         # total steps count
         self.total_step = 0
-
+        
         # mode: train / test
         self.is_test = False
 
@@ -515,14 +535,15 @@ class DDPGfDAgent:
         self, samples: Dict[str, np.ndarray], gamma: float
     ) -> torch.Tensor:
         """Return element-wise critic loss."""
-        device = self.device  # for shortening the following lines
+        device     = self.device  # for shortening the following lines
         state      = torch.FloatTensor(samples["obs"]).to(device)
-        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         action     = torch.FloatTensor(samples["acts"].reshape(-1, 1)).to(device)
         reward     = torch.FloatTensor(samples["rews"].reshape(-1, 1)).to(device)
+        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         done       = torch.FloatTensor(samples["done"].reshape(-1, 1)).to(device)
         
         masks = 1 - done
+        
         next_P_targs = self.actor_target(next_state)
         curr_Qs = self.critic(state, action)
         next_Q_targs = self.critic_target(next_state, next_P_targs)
@@ -538,7 +559,7 @@ class DDPGfDAgent:
         """Update the model by gradient descent."""
         device = self.device  # for shortening the following lines
         
-        samples = self.memory.sample_batch(self.beta)        
+        samples = self.memory.sample_batch(self.beta)
         state      = torch.FloatTensor(samples["obs"]).to(device)
         action     = torch.FloatTensor(samples["acts"].reshape(-1, 1)).to(device)
         weights    = torch.FloatTensor(samples["weights"].reshape(-1, 1)).to(device)
@@ -573,10 +594,11 @@ class DDPGfDAgent:
         actor_loss_element_wise = -self.critic(state, self.actor(state))
         actor_loss = torch.mean(actor_loss_element_wise * weights)
         # update policy
+        
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
-
+        
         # target update
         self._target_soft_update()
         
@@ -681,7 +703,7 @@ class ActionNormalizer(gym.ActionWrapper):
         return action
 
 # environment
-env_name = "Pendulum-v0"
+env_name = "Pendulum-v1"
 env = gym.make(env_name)
 env = ActionNormalizer(env)
 
@@ -700,7 +722,7 @@ initial_random_steps = 5000
 n_step = 3
 pretrain_step = 1000
 
-max_episodes = 300
+max_episodes = 100
 batch_size = 32
 
 # train
@@ -744,6 +766,7 @@ if __name__ == "__main__":
             """Take an action and return the response of the env."""
             next_state, reward, done, _ = agent.env.step(action)
             agent.transition += [reward, next_state, done]
+            
             # N-step transition
             transition = agent.transition
             if agent.use_n_step:
@@ -752,18 +775,19 @@ if __name__ == "__main__":
             # add a single step transition
             if transition:
                 agent.memory.store(*transition)
-
+            
             state = next_state
             episode_reward += reward
 
             frame_idx += 1
-
+            
             # PER: increase beta
             fraction = min(frame_idx / num_frames, 1.0)
             agent.beta = agent.beta + fraction * (1.0 - agent.beta)
-
+            
             # if episode ends
             if done:
+                state = agent.env.reset()
                 scores.append(episode_reward)
                 print("Episode " + str(episode+1) + ": " + str(episode_reward))
                 
@@ -774,4 +798,4 @@ if __name__ == "__main__":
                 critic_losses.append(critic_loss)
                 n_demo_list.append(n_demo)
 
-
+    
