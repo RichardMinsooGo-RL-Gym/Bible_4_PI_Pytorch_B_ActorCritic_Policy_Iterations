@@ -32,11 +32,11 @@ class ReplayBuffer:
         batch_size: int = 32, 
     ):
         """Initialize."""
-        self.obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.next_obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.acts_buf = np.zeros([size], dtype=np.float32)
-        self.rews_buf = np.zeros([size], dtype=np.float32)
-        self.done_buf = np.zeros([size], dtype=np.float32)
+        self.state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.action_memory = np.zeros([size], dtype=np.float32)
+        self.reward_memory = np.zeros([size], dtype=np.float32)
+        self.next_state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.done_memory = np.zeros([size], dtype=np.float32)
         self.max_size, self.batch_size = size, batch_size
         self.ptr, self.size = 0, 0
 
@@ -49,28 +49,30 @@ class ReplayBuffer:
         done: bool,
     ):
         """Store the transition in buffer."""
-        self.obs_buf[self.ptr] = obs
-        self.next_obs_buf[self.ptr] = next_obs
-        self.acts_buf[self.ptr] = act
-        self.rews_buf[self.ptr] = rew
-        self.done_buf[self.ptr] = done
+        self.state_memory[self.ptr] = obs
+        self.action_memory[self.ptr] = act
+        self.reward_memory[self.ptr] = rew
+        self.next_state_memory[self.ptr] = next_obs
+        self.done_memory[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
     def sample_batch(self) -> Dict[str, np.ndarray]:
         """Randomly sample a batch of experiences from memory."""
-        indices = np.random.choice(self.size, size=self.batch_size, replace=False)
-
-        return dict(
-            obs=self.obs_buf[indices],
-            next_obs=self.next_obs_buf[indices],
-            acts=self.acts_buf[indices],
-            rews=self.rews_buf[indices],
-            done=self.done_buf[indices],
-        )
+        idxs = np.random.choice(self.size, size=self.batch_size, replace=False)
+        
+        return dict(obs=self.state_memory[idxs],
+                    next_obs=self.next_state_memory[idxs],
+                    acts=self.action_memory[idxs],
+                    rews=self.reward_memory[idxs],
+                    done=self.done_memory[idxs],
+                    )
 
     def __len__(self) -> int:
         return self.size
+
+# PrioritizedReplayBuffer
+# Not Defined
 
 class OUNoise:
     """Ornstein-Uhlenbeck process.
@@ -113,7 +115,7 @@ class Actor(nn.Module):
         action_size: int,
         init_w: float = 3e-3,
     ):
-        """Initialize."""
+        """Initialization."""
         super(Actor, self).__init__()
         
         self.state_size = state_size
@@ -161,7 +163,7 @@ class CriticQ(nn.Module):
         return value
 
 class DDPGAgent:
-    """DDPGAgent interacting with environment.
+    """DDPG Agent interacting with environment.
     
     Attribute:
         env (gym.Env): openAI Gym environment
@@ -194,12 +196,14 @@ class DDPGAgent:
         tau: float = 5e-3,
         initial_random_steps: int = 1e4,
     ):
-        """Initialize."""
-        # networks
-        state_size = env.observation_space.shape[0]
-        action_size = env.action_space.shape[0]
-        
+        """
+        Initialization.
+        """
         self.env = env
+        # network parameters
+        self.state_size = self.env.observation_space.shape[0]
+        self.action_size = self.env.action_space.shape[0]
+        
         # hyperparameters
         self.batch_size = batch_size
         self.gamma = gamma
@@ -211,25 +215,25 @@ class DDPGAgent:
         print(self.device)
         
         # actor
-        self.actor = Actor(state_size, action_size
+        self.actor = Actor(self.state_size, self.action_size
                           ).to(self.device)
-        self.actor_target = Actor(state_size, action_size
+        self.actor_target = Actor(self.state_size, self.action_size
                           ).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        self.critic = CriticQ(state_size + action_size
+        self.critic = CriticQ(self.state_size + self.action_size
                           ).to(self.device)
-        self.critic_target = CriticQ(state_size + action_size).to(self.device)
+        self.critic_target = CriticQ(self.state_size + self.action_size).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
         # buffer
         self.memory = ReplayBuffer(
-            state_size, memory_size, batch_size
+             self.state_size, memory_size, batch_size
         )
         
         # noise
         self.exploration_noise = OUNoise(
-            action_size,
+            self.action_size,
             theta=ou_noise_theta,
             sigma=ou_noise_sigma,
         )
@@ -245,7 +249,7 @@ class DDPGAgent:
         
         # total steps count
         self.total_step = 0
-
+        
         # mode: train / test
         self.is_test = False
 
@@ -269,17 +273,18 @@ class DDPGAgent:
 
     def train_step(self) -> torch.Tensor:
         """Update the model by gradient descent."""
-        device = self.device  # for shortening the following lines
+        device     = self.device  # for shortening the following lines
         
         # sample from replay buffer
-        samples = self.memory.sample_batch()
+        samples    = self.memory.sample_batch()
         state      = torch.FloatTensor(samples["obs"]).to(device)
-        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         action     = torch.FloatTensor(samples["acts"].reshape(-1, 1)).to(device)
         reward     = torch.FloatTensor(samples["rews"].reshape(-1, 1)).to(device)
+        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         done       = torch.FloatTensor(samples["done"].reshape(-1, 1)).to(device)
         
         masks = 1 - done
+        
         next_P_targs = self.actor_target(next_state)
         curr_Qs = self.critic(state, action)
         next_Q_targs = self.critic_target(next_state, next_P_targs)
@@ -300,12 +305,12 @@ class DDPGAgent:
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
-
+        
         # target update
         self._target_soft_update()
         
         return actor_loss.data, critic_loss.data
-    
+        
     def _target_soft_update(self):
         """Soft-update: target = tau*local + (1-tau)*target."""
         tau = self.tau
@@ -350,11 +355,15 @@ class ActionNormalizer(gym.ActionWrapper):
         return action
 
 # environment
-env_name = "Pendulum-v0"
+env_name = "Pendulum-v1"
 env = gym.make(env_name)
 env = ActionNormalizer(env)
 
-# parameters
+
+'''
+Hyper Parameters
+'''
+
 memory_size = 2000
 ou_noise_theta = 1.0
 ou_noise_sigma = 0.1
@@ -363,7 +372,10 @@ initial_random_steps = 5000
 max_episodes = 300
 batch_size = 32
 
-# train
+'''
+Agent Define
+'''
+
 agent = DDPGAgent(
     env, 
     memory_size, 
@@ -382,19 +394,33 @@ if __name__ == "__main__":
     critic_losses = []
     scores        = []
     
+    # EACH EPISODE    
     for episode in range(max_episodes):
+        ## Reset environment and get first new observation
         state = agent.env.reset()
         episode_reward = 0
-        done = False
+        done = False  # has the enviroment finished?
         
         while not done:
+            '''
+            Get Action
+            '''
             action = agent.get_action(state)
-            # next_state, reward, done = agent.step(action)
-            """Take an action and return the response of the env."""
+            
+            '''
+            Execute Action and Observe
+            '''
             next_state, reward, done, _ = agent.env.step(action)
+            
+            '''
+            Store Transitions
+            '''          
             agent.transition += [reward, next_state, done]
             agent.memory.store(*agent.transition)
             
+            '''
+            Update state
+            '''     
             state = next_state
             episode_reward += reward
 
