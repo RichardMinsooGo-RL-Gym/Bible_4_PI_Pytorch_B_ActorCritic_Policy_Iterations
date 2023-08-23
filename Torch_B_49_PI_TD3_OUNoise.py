@@ -2,12 +2,10 @@ import sys
 IN_COLAB = "google.colab" in sys.modules
 
 import copy
-import os
 import random
 from typing import Dict, List, Tuple
 
 import gym
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,11 +32,11 @@ class ReplayBuffer:
         batch_size: int = 32, 
     ):
         """Initialize."""
-        self.obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.next_obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.acts_buf = np.zeros([size], dtype=np.float32)
-        self.rews_buf = np.zeros([size], dtype=np.float32)
-        self.done_buf = np.zeros([size], dtype=np.float32)
+        self.state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.action_memory = np.zeros([size], dtype=np.float32)
+        self.reward_memory = np.zeros([size], dtype=np.float32)
+        self.next_state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.done_memory = np.zeros([size], dtype=np.float32)
         self.max_size, self.batch_size = size, batch_size
         self.ptr, self.size = 0, 0
 
@@ -51,28 +49,31 @@ class ReplayBuffer:
         done: bool,
     ):
         """Store the transition in buffer."""
-        self.obs_buf[self.ptr] = obs
-        self.next_obs_buf[self.ptr] = next_obs
-        self.acts_buf[self.ptr] = act
-        self.rews_buf[self.ptr] = rew
-        self.done_buf[self.ptr] = done
+        self.state_memory[self.ptr] = obs
+        self.action_memory[self.ptr] = act
+        self.reward_memory[self.ptr] = rew
+        self.next_state_memory[self.ptr] = next_obs
+        self.done_memory[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
     def sample_batch(self) -> Dict[str, np.ndarray]:
         """Randomly sample a batch of experiences from memory."""
         indices = np.random.choice(self.size, size=self.batch_size, replace=False)
-
+        
         return dict(
-            obs=self.obs_buf[indices],
-            next_obs=self.next_obs_buf[indices],
-            acts=self.acts_buf[indices],
-            rews=self.rews_buf[indices],
-            done=self.done_buf[indices],
+            obs=self.state_memory[indices],
+            next_obs=self.next_state_memory[indices],
+            acts=self.action_memory[indices],
+            rews=self.reward_memory[indices],
+            done=self.done_memory[indices],
         )
 
     def __len__(self) -> int:
         return self.size
+
+# PrioritizedReplayBuffer
+# Not Defined
 
 class OUNoise:
     """Ornstein-Uhlenbeck process.
@@ -115,14 +116,16 @@ class Actor(nn.Module):
         action_size: int,
         init_w: float = 3e-3,
     ):
-        """Initialize."""
+        """Initialization."""
         super(Actor, self).__init__()
         
+        self.state_size = state_size
+        self.action_size = action_size
         # set the hidden layers
-        self.hidden1 = nn.Linear(state_size, 128)
+        self.hidden1 = nn.Linear(self.state_size, 128)
         self.hidden2 = nn.Linear(128, 128)
         
-        self.out = nn.Linear(128, action_size)
+        self.out = nn.Linear(128, self.action_size)
         
         self.out.weight.data.uniform_(-init_w, init_w)
         self.out.bias.data.uniform_(-init_w, init_w)
@@ -136,14 +139,14 @@ class Actor(nn.Module):
         
         return action
     
-class Critic(nn.Module):
+class CriticQ(nn.Module):
     def __init__(
         self, 
         state_size: int, 
         init_w: float = 3e-3,
     ):
         """Initialize."""
-        super(Critic, self).__init__()
+        super(CriticQ, self).__init__()
         
         self.hidden1 = nn.Linear(state_size, 128)
         self.hidden2 = nn.Linear(128, 128)
@@ -158,7 +161,6 @@ class Critic(nn.Module):
         x = F.relu(self.hidden1(x))
         x = F.relu(self.hidden2(x))
         value = self.out(x)
-        
         return value
 
 class TD3Agent:
@@ -173,8 +175,8 @@ class TD3Agent:
         actor_optimizer (Optimizer): optimizer for training actor
         critic1 (nn.Module): critic model to predict state values
         critic2 (nn.Module): critic model to predict state values
-        critic_target1 (nn.Module): target critic model to predict state values
-        critic_target2 (nn.Module): target critic model to predict state values        
+        critic1_target (nn.Module): target critic model to predict state values
+        critic2_target (nn.Module): target critic model to predict state values        
         critic_optimizer (Optimizer): optimizer for training critic
         memory (ReplayBuffer): replay memory to store transitions
         batch_size (int): batch size for sampling
@@ -206,13 +208,15 @@ class TD3Agent:
         initial_random_steps: int = 1e4,
         policy_update_freq: int = 2,
     ):
-        """Initialize."""
-        # networks
-        state_size = env.observation_space.shape[0]
-        action_size = env.action_space.shape[0]
-        
+        """
+        Initialization.
+        """
         self.env = env
+        # networks
+        self.state_size = self.env.observation_space.shape[0]
+        self.action_size = self.env.action_space.shape[0]
         
+        # hyperparameters
         self.batch_size = batch_size
         self.gamma = gamma
         self.tau = tau
@@ -224,33 +228,34 @@ class TD3Agent:
         print(self.device)
         
         # actor
-        self.actor = Actor(state_size, action_size
+        self.actor = Actor(self.state_size, self.action_size
                           ).to(self.device)
-        self.actor_target = Actor(state_size, action_size
+        self.actor_target = Actor(self.state_size, self.action_size
                           ).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        self.critic1 = Critic(state_size + action_size).to(self.device)
-        self.critic_target1 = Critic(state_size + action_size).to(self.device)
-        self.critic_target1.load_state_dict(self.critic1.state_dict())
+        self.critic1 = CriticQ(self.state_size + self.action_size).to(self.device)
+        self.critic2 = CriticQ(self.state_size + self.action_size).to(self.device)
+        
+        self.critic1_target = CriticQ(self.state_size + self.action_size).to(self.device)
+        self.critic1_target.load_state_dict(self.critic1.state_dict())
 
-        self.critic2 = Critic(state_size + action_size).to(self.device)
-        self.critic_target2 = Critic(state_size + action_size).to(self.device)
-        self.critic_target2.load_state_dict(self.critic2.state_dict())
+        self.critic2_target = CriticQ(self.state_size + self.action_size).to(self.device)
+        self.critic2_target.load_state_dict(self.critic2.state_dict())
         
         # buffer
         self.memory = ReplayBuffer(
-            state_size, memory_size, batch_size
+             self.state_size, memory_size, batch_size
         )
         
         # noise
         self.exploration_noise = OUNoise(
-            action_size,
+            self.action_size,
             theta=ou_noise_theta,
             sigma=ou_noise_sigma,
         )
         self.target_policy_noise = OUNoise(
-            action_size,
+            self.action_size,
             theta=ou_noise_theta,
             sigma=ou_noise_sigma,
         )
@@ -272,10 +277,10 @@ class TD3Agent:
         
         # total steps count
         self.total_step = 0
-
+        
         # update step for actor
         self.update_step = 0
-
+        
         # mode: train / test
         self.is_test = False
 
@@ -299,31 +304,36 @@ class TD3Agent:
 
     def train_step(self) -> torch.Tensor:
         """Update the model by gradient descent."""
-        device = self.device  # for shortening the following lines
+        device     = self.device  # for shortening the following lines
         
-        # sample from replay buffer
-        samples = self.memory.sample_batch()
+        '''
+        sample from replay buffer
+        '''
+        samples    = self.memory.sample_batch()
         state      = torch.FloatTensor(samples["obs"]).to(device)
-        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         action     = torch.FloatTensor(samples["acts"].reshape(-1, 1)).to(device)
         reward     = torch.FloatTensor(samples["rews"].reshape(-1, 1)).to(device)
+        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         done       = torch.FloatTensor(samples["done"].reshape(-1, 1)).to(device)
         
+        '''
+        Critic loss
+        '''
         masks = 1 - done
-
+        
         # get actions with noise
         noise = torch.FloatTensor(self.target_policy_noise.sample()).to(device)
         clipped_noise = torch.clamp(
             noise, -self.target_policy_noise_clip, self.target_policy_noise_clip
         )
-
-        pred_targs = (self.actor_target(next_state) + clipped_noise).clamp(-1.0, 1.0)
+        
+        next_P_targs = (self.actor_target(next_state) + clipped_noise).clamp(-1.0, 1.0)
 
         curr_Q1s = self.critic1(state, action)
         curr_Q2s = self.critic2(state, action)
         # min (Q_1', Q_2')
-        next_Q1_targs = self.critic_target1(next_state, pred_targs)
-        next_Q2_targs = self.critic_target2(next_state, pred_targs)
+        next_Q1_targs = self.critic1_target(next_state, next_P_targs)
+        next_Q2_targs = self.critic2_target(next_state, next_P_targs)
         next_values = torch.min(next_Q1_targs, next_Q2_targs)
 
         # G_t   = r + gamma * v(s_{t+1})  if state != Terminal
@@ -338,26 +348,45 @@ class TD3Agent:
         # train critic
         critic_loss = critic1_loss + critic2_loss
         
-        # update value
+        '''
+        Reset Critic Gradient
+        '''
         self.critic_optimizer.zero_grad()
+        
+        '''
+        Update Critic -Q,one-step
+        '''
         critic_loss.backward()
         self.critic_optimizer.step()
         
         if self.total_step % self.policy_update_freq == 0:
-            # train actor
+            '''
+            Actor Loss
+            '''
             actor_loss = -self.critic1(state, self.actor(state)).mean()
-            # update policy
+            
+            # train actor
+
+            '''
+            Reset Actor Gradient
+            '''
             self.actor_optimizer.zero_grad()
+            
+            '''
+            Update Actor,n-tep
+            '''
             actor_loss.backward()
             self.actor_optimizer.step()
 
-            # target update
+            '''
+            target update
+            '''
             self._target_soft_update()
         else:
             actor_loss = torch.zeros(1)
         
         return actor_loss.data, critic_loss.data
-
+        
     def _target_soft_update(self):
         """Soft-update: target = tau*local + (1-tau)*target."""
         tau = self.tau
@@ -368,12 +397,12 @@ class TD3Agent:
             t_param.data.copy_(tau * l_param.data + (1.0 - tau) * t_param.data)
 
         for t_param, l_param in zip(
-            self.critic_target1.parameters(), self.critic1.parameters()
+            self.critic1_target.parameters(), self.critic1.parameters()
         ):
             t_param.data.copy_(tau * l_param.data + (1.0 - tau) * t_param.data)
 
         for t_param, l_param in zip(
-            self.critic_target2.parameters(), self.critic2.parameters()
+            self.critic2_target.parameters(), self.critic2.parameters()
         ):
             t_param.data.copy_(tau * l_param.data + (1.0 - tau) * t_param.data)
     
@@ -407,7 +436,7 @@ class ActionNormalizer(gym.ActionWrapper):
         return action
 
 # environment
-env_name = "Pendulum-v0"
+env_name = "Pendulum-v1"
 env = gym.make(env_name)
 env = ActionNormalizer(env)
 
@@ -439,24 +468,39 @@ if __name__ == "__main__":
     critic_losses = []
     scores        = []
     
+    # EACH EPISODE    
     for episode in range(max_episodes):
+        ## Reset environment and get first new observation
         state = agent.env.reset()
         episode_reward = 0
-        done = False
+        done = False  # has the enviroment finished?
         
         while not done:
+            '''
+            Get Action
+            '''
             action = agent.get_action(state)
-            # next_state, reward, done = agent.step(action)
-            """Take an action and return the response of the env."""
+            
+            '''
+            Execute Action and Observe
+            '''
             next_state, reward, done, _ = agent.env.step(action)
+            
+            '''
+            Store Transitions
+            '''          
             agent.transition += [reward, next_state, done]
             agent.memory.store(*agent.transition)
             
+            '''
+            Update state
+            '''     
             state = next_state
             episode_reward += reward
 
             # if episode ends
             if done:
+                state = agent.env.reset()
                 scores.append(episode_reward)
                 print("Episode " + str(episode+1) + ": " + str(episode_reward))
                 
