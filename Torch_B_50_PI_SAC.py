@@ -12,7 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from IPython.display import clear_output
-import matplotlib.pyplot as plt
 
 if torch.backends.cudnn.enabled:
     torch.backends.cudnn.benchmark = False
@@ -33,11 +32,11 @@ class ReplayBuffer:
         batch_size: int = 32, 
     ):
         """Initialize."""
-        self.obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.next_obs_buf = np.zeros([size, state_size], dtype=np.float32)
-        self.acts_buf = np.zeros([size], dtype=np.float32)
-        self.rews_buf = np.zeros([size], dtype=np.float32)
-        self.done_buf = np.zeros([size], dtype=np.float32)
+        self.state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.action_memory = np.zeros([size], dtype=np.float32)
+        self.reward_memory = np.zeros([size], dtype=np.float32)
+        self.next_state_memory = np.zeros([size, state_size], dtype=np.float32)
+        self.done_memory = np.zeros([size], dtype=np.float32)
         self.max_size, self.batch_size = size, batch_size
         self.ptr, self.size = 0, 0
 
@@ -50,24 +49,24 @@ class ReplayBuffer:
         done: bool,
     ):
         """Store the transition in buffer."""
-        self.obs_buf[self.ptr] = obs
-        self.next_obs_buf[self.ptr] = next_obs
-        self.acts_buf[self.ptr] = act
-        self.rews_buf[self.ptr] = rew
-        self.done_buf[self.ptr] = done
+        self.state_memory[self.ptr] = obs
+        self.action_memory[self.ptr] = act
+        self.reward_memory[self.ptr] = rew
+        self.next_state_memory[self.ptr] = next_obs
+        self.done_memory[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
     def sample_batch(self) -> Dict[str, np.ndarray]:
         """Randomly sample a batch of experiences from memory."""
         indices = np.random.choice(self.size, size=self.batch_size, replace=False)
-
+        
         return dict(
-            obs=self.obs_buf[indices],
-            next_obs=self.next_obs_buf[indices],
-            acts=self.acts_buf[indices],
-            rews=self.rews_buf[indices],
-            done=self.done_buf[indices],
+            obs=self.state_memory[indices],
+            next_obs=self.next_state_memory[indices],
+            acts=self.action_memory[indices],
+            rews=self.reward_memory[indices],
+            done=self.done_memory[indices],
         )
 
     def __len__(self) -> int:
@@ -88,7 +87,7 @@ class Actor(nn.Module):
         log_std_min: float = -20,
         log_std_max: float = 2,
     ):
-        """Initialize."""
+        """Initialization."""
         super(Actor, self).__init__()
         
         # set the log std range
@@ -179,6 +178,7 @@ class SACAgent:
     """SAC agent interacting with environment.
     
     Attribute:
+        env (gym.Env): openAI Gym environment
         actor (nn.Module): actor model to select actions
         actor_optimizer (Optimizer): optimizer for training actor
         vf (nn.Module): critic model to predict state values
@@ -214,12 +214,14 @@ class SACAgent:
         initial_random_steps: int = 1e4,
         policy_update_freq: int = 2,
     ):
-        """Initialize."""
-        # networks
-        
+        """
+        Initialization.
+        """
         self.env = env
-        state_size = env.observation_space.shape[0]
-        action_size = env.action_space.shape[0]
+        # networks
+        self.state_size = self.env.observation_space.shape[0]
+        self.action_size = self.env.action_space.shape[0]
+        
         # hyperparameters
         self.batch_size = batch_size
         self.gamma = gamma
@@ -232,24 +234,24 @@ class SACAgent:
         print(self.device)
         
         # actor
-        self.actor = Actor(state_size, action_size
+        self.actor = Actor(self.state_size, self.action_size
                           ).to(self.device)
         
         # q function
-        self.critic1 = CriticQ(state_size + action_size).to(self.device)
-        self.critic2 = CriticQ(state_size + action_size).to(self.device)
+        self.critic1 = CriticQ(self.state_size + self.action_size).to(self.device)
+        self.critic2 = CriticQ(self.state_size + self.action_size).to(self.device)
         
         # v function
-        self.value_net = CriticV(state_size).to(self.device)
-        self.target_value_net = CriticV(state_size).to(self.device)
+        self.value_net = CriticV(self.state_size).to(self.device)
+        self.target_value_net = CriticV(self.state_size).to(self.device)
         self.target_value_net.load_state_dict(self.value_net.state_dict())
         # buffer
         self.memory = ReplayBuffer(
-            state_size, memory_size, batch_size
+            self.state_size, memory_size, batch_size
         )
         
         # automatic entropy tuning
-        self.target_entropy = -np.prod((action_size,)).item()  # heuristic
+        self.target_entropy = -np.prod((self.action_size,)).item()  # heuristic
         self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
         
@@ -285,14 +287,14 @@ class SACAgent:
 
     def train_step(self) -> Tuple[torch.Tensor, ...]:
         """Update the model by gradient descent."""
-        device = self.device  # for shortening the following lines
+        device     = self.device  # for shortening the following lines
         
         # sample from replay buffer
-        samples = self.memory.sample_batch()
+        samples    = self.memory.sample_batch()
         state      = torch.FloatTensor(samples["obs"]).to(device)
-        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         action     = torch.FloatTensor(samples["acts"].reshape(-1, 1)).to(device)
         reward     = torch.FloatTensor(samples["rews"].reshape(-1, 1)).to(device)
+        next_state = torch.FloatTensor(samples["next_obs"]).to(device)
         done       = torch.FloatTensor(samples["done"].reshape(-1, 1)).to(device)
         new_actions, new_log_Pis = self.actor(state)
         
@@ -401,7 +403,7 @@ class ActionNormalizer(gym.ActionWrapper):
         return action
 
 # environment
-env_name = "Pendulum-v0"
+env_name = "Pendulum-v1"
 env = gym.make(env_name)
 env = ActionNormalizer(env)
 
@@ -430,10 +432,12 @@ if __name__ == "__main__":
     scores        = []
     value_losses, alpha_losses = [], []
     
+    # EACH EPISODE    
     for episode in range(max_episodes):
+        ## Reset environment and get first new observation
         state = agent.env.reset()
         episode_reward = 0
-        done = False
+        done = False  # has the enviroment finished?
         
         while not done:
             action = agent.get_action(state)
